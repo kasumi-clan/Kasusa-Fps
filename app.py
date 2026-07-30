@@ -1,11 +1,14 @@
-import os, uuid, threading, subprocess, re
+import os, uuid, threading, subprocess, re, time
 from flask import Flask, request, jsonify, Response, send_from_directory
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE, "uploads")
 OUTPUT_DIR = os.path.join(BASE, "outputs")
+LOG_DIR = os.path.join(BASE, "logs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+FFMPEG_TIMEOUT = 600  # giây - quá thời gian này sẽ tự huỷ và báo lỗi, không treo mãi
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = None
@@ -244,26 +247,41 @@ def process_video(job_id, in_path, out_path, fps, height, motion, intensity):
     vf = build_filter(height, fps, motion, intensity)
     cmd = ["ffmpeg", "-y", "-i", in_path, "-vf", vf,
            "-crf", "20", "-preset", "veryfast", "-c:v", "libx264",
-           "-c:a", "aac", "-progress", "pipe:1", "-nostats", out_path]
+           "-c:a", "aac", "-progress", "pipe:1", out_path]
+    log_path = os.path.join(LOG_DIR, job_id + ".log")
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        for line in proc.stdout:
-            m = re.search(r"out_time_ms=(\d+)", line)
-            if m and duration > 0:
-                ms = int(m.group(1))
-                JOBS[job_id]["percent"] = min(99, int((ms / 1000000) / duration * 100))
-            if "progress=end" in line:
-                JOBS[job_id]["percent"] = 100
-        proc.wait()
+        with open(log_path, "w") as errlog:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errlog, text=True)
+            start = time.time()
+            for line in proc.stdout:
+                if time.time() - start > FFMPEG_TIMEOUT:
+                    proc.kill()
+                    JOBS[job_id].update(error="Xử lý quá lâu (quá {}s) - có thể server đang thiếu tài nguyên. Thử video ngắn/nhẹ hơn.".format(FFMPEG_TIMEOUT), done=True)
+                    return
+                m = re.search(r"out_time_ms=(\d+)", line)
+                if m and duration > 0:
+                    ms = int(m.group(1))
+                    JOBS[job_id]["percent"] = min(99, int((ms / 1000000) / duration * 100))
+                if "progress=end" in line:
+                    JOBS[job_id]["percent"] = 100
+            proc.wait(timeout=30)
         if proc.returncode == 0 and os.path.exists(out_path):
             JOBS[job_id].update(percent=100, done=True, file=os.path.basename(out_path))
         else:
-            JOBS[job_id].update(error="ffmpeg xử lý thất bại", done=True)
+            tail = ""
+            try:
+                with open(log_path, "r", errors="ignore") as f:
+                    tail = f.read()[-350:]
+            except Exception:
+                pass
+            JOBS[job_id].update(error="ffmpeg lỗi (mã {}): {}".format(proc.returncode, tail or "không rõ nguyên nhân"), done=True)
     except Exception as e:
-        JOBS[job_id].update(error=str(e), done=True)
+        JOBS[job_id].update(error="Lỗi hệ thống: " + str(e), done=True)
     finally:
         if os.path.exists(in_path):
             os.remove(in_path)
+        if os.path.exists(log_path):
+            os.remove(log_path)
 
 
 @app.route("/")
