@@ -8,7 +8,7 @@ LOG_DIR = os.path.join(BASE, "logs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
-FFMPEG_TIMEOUT = 600
+FFMPEG_TIMEOUT = 300  # giây - quá thời gian này sẽ tự huỷ và báo lỗi, không treo mãi
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = None
@@ -139,6 +139,7 @@ function toggleIntensity(){
 motionSel.addEventListener('change', toggleIntensity);
 toggleIntensity();
 
+// --- Tự đánh thức server nếu đang "ngủ" (Render free tier) ---
 async function wakeServer(maxMs){
   const start=Date.now();
   while(Date.now()-start < maxMs){
@@ -183,10 +184,16 @@ form.addEventListener('submit', async (e)=>{
   }catch(err){ showError('Lỗi kết nối tới server.'); resetBtn(); }
 });
 function pollProgress(jobId){
+  let fails=0, busy=false;
+  const MAX_FAILS=12; // ~12 lần thử lại (khoảng 8-9 giây) trước khi báo lỗi thật
   const timer=setInterval(async ()=>{
+    if(busy) return;
+    busy=true;
     try{
-      const res=await fetch('/progress/'+jobId); const data=await res.json();
-      if(data.error){ clearInterval(timer); showError(data.error); resetBtn(); return; }
+      const res=await fetch('/progress/'+jobId,{cache:'no-store'});
+      const data=await res.json();
+      fails=0;
+      if(data.error){ clearInterval(timer); showError(data.error); resetBtn(); busy=false; return; }
       setProgress(data.percent||0);
       if(data.done){
         clearInterval(timer);
@@ -198,7 +205,16 @@ function pollProgress(jobId){
         } else { showError('Xử lý thất bại, vui lòng thử lại.'); }
         resetBtn();
       }
-    }catch(err){ clearInterval(timer); showError('Mất kết nối trong khi xử lý.'); resetBtn(); }
+    }catch(err){
+      fails++;
+      statusText.textContent='Mất kết nối tạm thời, đang thử lại... ('+fails+'/'+MAX_FAILS+')';
+      if(fails>=MAX_FAILS){
+        clearInterval(timer);
+        showError('Mất kết nối trong khi xử lý. Server có thể đã khởi động lại - thử tải video lên lại nhé.');
+        resetBtn();
+      }
+    }
+    busy=false;
   },700);
 }
 function setProgress(p){ progressFill.style.width=p+'%'; progressLabel.textContent=p+'%'; }
@@ -224,7 +240,7 @@ def build_filter(height, fps, motion, intensity):
     if height:
         parts.append(f"scale=-2:{height}:flags=lanczos")
     if motion == "smooth":
-        parts.append(f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:vsbmc=1")
+        parts.append(f"minterpolate=fps={fps}:mi_mode=blend")
     else:
         step = LAG_MAP.get(intensity, "6")
         parts.append(f"fps={step}")
@@ -239,15 +255,19 @@ def process_video(job_id, in_path, out_path, fps, height, motion, intensity):
            "-crf", "20", "-preset", "veryfast", "-c:v", "libx264",
            "-c:a", "aac", "-progress", "pipe:1", out_path]
     log_path = os.path.join(LOG_DIR, job_id + ".log")
+    timed_out = {"flag": False}
+    watchdog = None
     try:
         with open(log_path, "w") as errlog:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errlog, text=True)
-            start = time.time()
+
+            def kill_on_timeout():
+                timed_out["flag"] = True
+                proc.kill()
+            watchdog = threading.Timer(FFMPEG_TIMEOUT, kill_on_timeout)
+            watchdog.start()
+
             for line in proc.stdout:
-                if time.time() - start > FFMPEG_TIMEOUT:
-                    proc.kill()
-                    JOBS[job_id].update(error="Xử lý quá lâu (quá {}s) - có thể server đang thiếu tài nguyên. Thử video ngắn/nhẹ hơn.".format(FFMPEG_TIMEOUT), done=True)
-                    return
                 m = re.search(r"out_time_ms=(\d+)", line)
                 if m and duration > 0:
                     ms = int(m.group(1))
@@ -255,6 +275,10 @@ def process_video(job_id, in_path, out_path, fps, height, motion, intensity):
                 if "progress=end" in line:
                     JOBS[job_id]["percent"] = 100
             proc.wait(timeout=30)
+        watchdog.cancel()
+        if timed_out["flag"]:
+            JOBS[job_id].update(error="Xử lý quá lâu (quá {}s) - server thiếu tài nguyên. Thử độ phân giải/hiệu ứng nhẹ hơn hoặc video ngắn hơn.".format(FFMPEG_TIMEOUT), done=True)
+            return
         if proc.returncode == 0 and os.path.exists(out_path):
             JOBS[job_id].update(percent=100, done=True, file=os.path.basename(out_path))
         else:
@@ -266,6 +290,8 @@ def process_video(job_id, in_path, out_path, fps, height, motion, intensity):
                 pass
             JOBS[job_id].update(error="ffmpeg lỗi (mã {}): {}".format(proc.returncode, tail or "không rõ nguyên nhân"), done=True)
     except Exception as e:
+        if watchdog:
+            watchdog.cancel()
         JOBS[job_id].update(error="Lỗi hệ thống: " + str(e), done=True)
     finally:
         if os.path.exists(in_path):
